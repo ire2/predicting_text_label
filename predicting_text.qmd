@@ -1,0 +1,791 @@
+---
+title: "Predicting Text Labels"
+author: "Ignacio Estrada Cavero (ire2)"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+execute:
+  cache: true
+  eval: false
+  jupyter: python3
+  warning: false
+format:
+  html:
+    fig-format: png
+---
+
+# Setup
+
+## Load packages and data:
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(tidymodels)
+library(probably)
+library(colorspace)
+library(textrecipes)
+library(discrim)
+library(hardhat)
+library(vip)
+library(tidytext)
+# additional
+library(furrr)
+library(gt)
+library(renv)
+library(keras3)
+library(textdata)
+library(arrow)
+library(stopwords)
+library(themis)
+library(naivebayes)
+library(hardhat)
+library(pROC)
+
+```
+
+## Parallel Processing 
+```{r}
+renv::snapshot()
+plan(multisession)
+```
+
+## Load Data 
+```{r}
+#| label: import-news
+
+news <- read_csv(file = "data/WELFake_Dataset.csv.gz") |>
+  rename(.id = `...1`) |>
+  mutate(label = factor(x = label, levels = 0:1, labels = c("Real", "Fake"))) |>
+  drop_na(label, text)
+glimpse(news)
+```
+
+# Exploratory Questioning
+
+## What is Reality ?
+
+Humans have always questioned what they perceive as real. For example, consider the skepticism surrounding the moon landing, where a minority questioned its authenticity while the majority accepted it as fact, viewing skeptics as unconventional. Traditionally, these controversial beliefs were confined to private circles or small communities, but the digital world has changed this dynamic. Now, online echo chambers provide spaces where individuals with similar erroneous views can amplify one another, reinforcing their own version of reality. In these spaces, ideas that lack evidence can gain legitimacy simply through repetition and affirmation, creating a feedback loop that normalizes and solidifies these perspectives. To them the information becomes real.
+
+This raises the question: does something become "real news" if it is widely repeated and accepted within a group, even without verifiable backing? In these echo chambers, beliefs that might once have been marginalized or openly challenged find themselves validated and grow, as individuals seek out and engage with others who share similar views. This shift not only changes the sources we see as legitimate but also reshapes our very understanding of truth. As consensus becomes fragmented, the boundaries of "truth" and "reality" shift, influenced by the dynamics of digital interactions and selective exposure. As a community, we are no longer grounded by the parasocial rules that dominated in-person interaction, but now coexist in the largely "wild-west" of interactions within the digital landscape.
+
+For models trying to distinguish real from fake news, these self-sustaining digital realities present a new layer of complexity. Models typically rely on identifiable patterns and features to measure truthfulness, yet these echo chambers generate and reinforce what users perceive as “real” within insular networks. When truth itself becomes fragmented across different communities, determining authenticity requires models to account not only for the content but for the social dynamics that shape its perception. This evolution in how beliefs are validated online adds a new dimension to the challenge of parsing “real” versus “fake,” revealing that truth, once seen as universal, is now deeply influenced by the shifting realities of digital interaction.
+
+
+## What is Success? 
+
+When it comes to defining and detecting misinformation on digital platforms, the challenge lies in that the perfect platform would meet the users high expectations of 100% perfect detection. Any instance of misinformation that slips through the cracks is often perceived as a platform failure if they state to reach for this threshold. Even then, if the platforms like Facebook or Twitter it would struggle to catch all misinformation without risking user trust, especially if it involves monitoring “private” messages that users assume to be confidential. This challenge is compounded by the difficulty of quantifying subjective statements. If someone says, “X person is mean,” for example, is there a way to flag this as inaccurate without understanding the full context or dismissing the user’s personal perspective? Platforms risk imposing an overly rigid view of “truth,” which may conflict with users’ right to express their beliefs or opinions.
+
+As a result, the burden of responsibility of most platforms becomes not to guarantee perfection but to do their best to minimize misinformation. However, even with this more reasonable threshold, platforms still face the risk of mislabeling: marking real information as fake or missing pieces of actual misinformation. Mislabeling genuine information as false can lead to user frustration, accusations of censorship, and an erosion of trust in the platform’s neutrality. Even a simple case of not flagging a statement such as "It's raining outside" can errode the users trust if they hold the plaform to a high level of reliability. Conversely, failing to identify misinformation can lead to significant harm, as users may be misled on critical issues like public health or politics, ultimately damaging the platform’s reputation as a reliable information source. Even more troubling is the potential for fake articles to align with hate speech or harassment, exacerbating its impact by fostering harmful biases, reinforcing negative stereotypes, or inciting hostility. Misinformation has the potential if left unfiltyered to fuel toxic environments and endnger the well-being of indivduals and sensitive communities.
+
+To balance these concerns, platforms must rely on thoughtful metrics to assess their detection models. Precision and recall are probably the most important, as high precision ensures flagged content is genuinely misinformation, while a high recall would capture as much of the actual misinformation as possible. The F1-score is also valuable for balancing these two metrics, minimizing both false positives and false negatives. However, I believe a dynamic approach to flagging algorithm metrics is crucial, as not all misinformation carries the same risk. Metrics should adapt based on the potential for harm or the extent to which content violates platform guidelines. For instance, misinformation with a high potential for public harm, such as false information about health practices or content bordering on hate speech, might prioritize recall to ensure harmful content is less likely to circulate. Conversely, in cases with lower risk, precision might be weighted more heavily to prevent unnecessary flagging.
+
+# Split/Preprocessing Data
+
+```{r}
+news_split <- initial_split(news, strata = label, prop = 0.75)
+news_train <- training(news_split)
+news_test <- testing(news_split)
+news_folds <- vfold_cv(news_train, v = 5, strata = label)
+```
+
+# Null Model 
+
+- See above for Pre-Processing Data into Train and Test and Folds, makes it easier to find it outline 
+
+CV Resamplng: I utilized this resampling method because its quite standard used across the textbook, allowing for robust cross validation as the training data is further partitioned into validation and training data. However, due to memory limitations I was only able to do 5 folds instead of the usual 10. 
+
+## Null Model Data Pre-Processing
+
+```{r}
+news_recipe <- recipe(label ~ text, data = news_train) |>
+  step_tokenize(text) |>
+  step_tokenfilter(text, max_tokens = 5000) |>
+  step_tfidf(text)
+
+null_classification <- null_model() %>%
+  set_engine("parsnip") %>%
+  set_mode("classification")
+
+
+null_rs <- workflow() %>%
+  add_recipe(news_recipe) %>%
+  add_model(null_classification) %>%
+  fit_resamples(
+    news_folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+```
+
+## Metrics
+
+```{r}
+metrics_data <- null_rs %>% collect_metrics()
+null_predictions <- null_rs %>% collect_predictions()
+```
+
+## Results 
+
+### Metric Summary Table
+
+```{r}
+
+metrics_data %>%
+  gt() %>%
+  tab_header(
+    title = "Null Performance Metrics Across 5 Folds"
+  ) %>%
+  fmt_number(
+    columns = c(mean, std_err),
+    decimals = 3
+  ) %>%
+  cols_label(
+    .metric = "Metric",
+    mean = "Mean Value",
+    std_err = "Standard Error"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+```
+
+###  Confusion Matrix 
+```{r}
+confusion <- null_predictions %>%
+  conf_mat(truth = label, estimate = .pred_class)
+autoplot(confusion, type = "heatmap") +
+  labs(
+    title = "Confusion Matrix for Null Model",
+    subtitle = "Predicted vs. Actual Labels"
+  ) +
+  theme_minimal()
+```
+
+### Predictions Distribution 
+```{r}
+ggplot(null_predictions, aes(x = .pred_Real)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  labs(
+    title = "Distribution of Predicted Probabilities for 'Real' Class",
+    x = "Predicted Probability",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+### ROC 
+```{r}
+null_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = label, .pred_Real) %>%  # Using .pred_Real or .pred_Fake as needed
+  autoplot() +
+  labs(
+    color = "Fold",
+    title = "ROC Curve for Real vs. Fake Text Labeling",
+    subtitle = "Each resample fold is shown in a different color"
+  ) +
+  theme_minimal()
+```
+
+## Analysis 
+
+The Null Model performs about the same as Random "guessing"coin toss", with an accuracy value of about 50%, Brier Score of .25 and ROC-AUC of .5. It predicts Fake in every case serving as a good baseline for comparing later models.  
+
+# Exercise 4:Naive Bayes
+
+## Pre-Processing 
+
+```{r}
+library(discrim) # put it here again cause i kept getting an error 
+
+news_recipe <- recipe(label ~ text, data = news_train) |>
+  step_tokenize(text) |>
+  step_stem(text) |>
+  step_stopwords(text) |>
+  step_ngram(text) |>
+  step_tokenfilter(text, max_tokens = 5000) |>
+  step_tfidf(text) |>
+  step_downsample(label)
+
+
+nb_workflow <- workflow() %>%
+  add_recipe(news_recipe)
+
+nb_spec <- naive_Bayes() |>
+  set_mode("classification") |>
+  set_engine("naivebayes")
+
+nb_workflow <- nb_workflow %>%
+  add_model(nb_spec)
+
+
+```
+
+
+```{r}
+nb_rs <- fit_resamples(
+  nb_workflow,
+  news_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+## Results
+
+```{r}
+nb_rs_metrics <- collect_metrics(nb_rs)
+nb_rs_predictions <- collect_predictions(nb_rs)
+```
+
+### Metrics Summary Table 
+```{r}
+nb_rs_metrics %>%
+  gt() %>%
+  tab_header(
+    title = "Naive Bayes Model Performance Metrics Across 5 Folds"
+  ) %>%
+  fmt_number(
+    columns = c(mean, std_err),
+    decimals = 3
+  ) %>%
+  cols_label(
+    .metric = "Metric",
+    mean = "Mean Value",
+    std_err = "Standard Error"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+
+```
+### Confusion Matrix
+```{r}
+confusion <- nb_rs %>%
+  conf_mat(truth = label, estimate = .pred_class)
+autoplot(confusion, type = "heatmap") +
+  labs(
+    title = "Confusion Matrix for Final Lasso Model",
+    subtitle = "Predicted vs. Actual Labels"
+  ) +
+  theme_minimal()
+```
+### Predictions Distributions 
+```{r}
+ggplot(nb_rs_predictions, aes(x = .pred_Real)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  labs(
+    title = "Distribution of Predicted Probabilities for 'Real' Class",
+    x = "Predicted Probability",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+### ROC
+```{r}
+
+nb_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = label, .pred_Real) %>%  # Using .pred_Real or .pred_Fake as needed
+  autoplot() +
+  labs(
+    color = "Fold",
+    title = "ROC Curve for Real vs. Fake Text Labeling",
+    subtitle = "Each resample fold is shown in a different color"
+  ) +
+  theme_minimal()
+
+```
+
+
+### F1 value 
+```{r}
+f1_results <- nb_rs_predictions %>%
+  group_by(id) %>%
+  f_meas(truth = label, estimate = .pred_class)
+
+mean_f1 <- mean(f1_results$.estimate)
+
+ggplot(f1_results, aes(x = id, y = .estimate)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_hline(yintercept = mean_f1, color = "red", linetype = "dashed") +
+  annotate("text", x = Inf, y = mean_f1, label = paste("Mean F1 Score:", round(mean_f1, 2)), 
+           vjust = -0.5, hjust = 1.2, color = "red", size = 5) +
+  labs(
+    title = "F1 Score per Cross-Validation Fold",
+    x = "Fold",
+    y = "F1 Score"
+  ) +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+## 
+## Analysis 
+
+The Naive Bayes Model predicts barely better than the Null Model with an accuracy of about 51% with a Brier Score of0.486. However, the ROC-AUC value of 0.769 demonstrates that the model performs better at ranking predictions than the null Model, demonstrating that it can somewhat distinguish between what classifies a "Real" and "Fake" News Article. Moreover an F1 adds to that demonstrating it can somehow identify "Real" and "Fake" articles it struggles at balancing these predictions which is made event by the Confusion Matric in which almost all predictions are Fake with some predictions of Real differing from the Null Model. 
+
+# Exercise 5: Lasso
+
+## Pre-Processig
+```{r}
+news_recipe <- recipe(label ~ text, data = news_train) |>
+  step_tokenize(text) |>
+  step_stem(text) |>
+  step_stopwords(text) |>
+  step_tokenfilter(text, max_tokens = 5000) |>
+  step_tfidf(text) |>
+  step_downsample(label)
+
+penalty_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 30)
+
+lasso_spec <- logistic_reg(penalty = 0.01, mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lasso_wf <- workflow() %>%
+  add_recipe(news_recipe) %>%
+  add_model(lasso_spec)
+
+lasso_rs <- tune_grid(
+  lasso_wf,
+  news_folds,
+  grid = penalty_grid,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+
+
+## Results For Resampled 
+```{r}
+lasso_rs_metrics <- collect_metrics(lasso_rs)
+lasso_rs_predictions <- collect_predictions(lasso_rs)
+```
+
+### Metrics Summary Table 
+```{r}
+lasso_rs_metrics %>%
+  gt() %>%
+  tab_header(
+    title = "Lasso Model Performance Metrics Across 5 Folds"
+  ) %>%
+  fmt_number(
+    columns = c(mean, std_err),
+    decimals = 3
+  ) %>%
+  cols_label(
+    .metric = "Metric",
+    mean = "Mean Value",
+    std_err = "Standard Error"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+
+```
+
+### Confusion Matrix
+```{r}
+confusion <- lasso_rs_predictions %>%
+  conf_mat(truth = label, estimate = .pred_class)
+autoplot(confusion, type = "heatmap") +
+  labs(
+    title = "Confusion Matrix for Final Lasso Model",
+    subtitle = "Predicted vs. Actual Labels"
+  ) +
+  theme_minimal()
+```
+
+
+
+### ROC 
+```{r}
+lasso_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = label, .pred_Real) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "ROC curve for ",
+    subtitle = "Each resample fold is shown in a different color"
+  )
+```
+### F1 Value 
+```{r}
+f1_results <- lasso_rs_predictions %>%
+  group_by(id) %>%
+  f_meas(truth = label, estimate = .pred_class)
+
+mean_f1 <- mean(f1_results$.estimate)
+
+ggplot(f1_results, aes(x = id, y = .estimate)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_hline(yintercept = mean_f1, color = "red", linetype = "dashed") +
+  annotate("text", x = Inf, y = mean_f1, label = paste("Mean F1 Score:", round(mean_f1, 2)), 
+           vjust = -0.5, hjust = 1.2, color = "red", size = 5) +
+  labs(
+    title = "F1 Score per Cross-Validation Fold",
+    x = "Fold",
+    y = "F1 Score"
+  ) +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+## Best Lasso Predictions 
+```{r}
+best_lasso <- select_best(lasso_rs, metric ="roc_auc")
+
+final_lasso_wf <- finalize_workflow(lasso_wf, best_lasso)
+
+final_lasso_fit <- fit(final_lasso_wf, data = news_train)
+
+```
+
+## Results for Final Fit 
+
+```{r}
+final_lasso_predictions <- predict(final_lasso_fit, news_test, type = "prob") %>%
+  bind_cols(predict(final_lasso_fit, news_test)) %>%
+  bind_cols(news_test %>% select(label))
+
+final_metrics <- final_lasso_predictions %>%
+  metrics(truth = label, estimate = .pred_class, .pred_Real)
+```
+
+### Variable Importance 
+
+```{r}
+importance <- final_lasso_fit %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(abs(estimate))) %>%
+  head(20)
+
+ggplot(importance, aes(x = reorder(term, abs(estimate)), y = estimate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Most Influential Tokens",
+       x = "Token",
+       y = "Coefficient Estimate")
+```
+
+## Analysis 
+
+The Lasso regression model significantly outperforms both the Naive Bayes and null models, achieving an  accuracy of 91.9% and a high F1 score of 0.92. A Brier score of 0.066 indicates strong calibration, meaning its predictions are reliably close to actual outcomes. Additionally, the ROC-AUC score of 0.977 reflects excellent discriminatory power, showing that the model is highly effective in distinguishing between real and fake articles.
+
+# Exercise 6: Lasso Tuned
+
+## Pre-Processing 
+```{r}
+sparse_bp <- default_recipe_blueprint(composition = "dgCMatrix")
+
+news_recipe <- recipe(label ~ text, data = news_train) |>
+  step_tokenize(text) |>
+  step_stopwords(text) |>
+  step_stem(text) |>
+  step_ngram(text) |>
+  step_tokenfilter(text, max_tokens = 2000) |>
+  step_tfidf(text) |>
+  step_downsample(label)
+
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) |>
+  set_mode("classification") |>
+  set_engine("glmnet")
+
+lasso_wf <- workflow() %>%
+  add_recipe(news_recipe, blueprint = sparse_bp) %>%
+  add_model(lasso_spec)
+
+penalty_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 30)
+
+lasso_rs <- tune_grid(
+  lasso_wf,
+  resamples = news_folds,
+  grid = penalty_grid,
+  control = control_grid(save_pred = TRUE)
+)
+```
+## Best Lasso Predictions 
+```{r}
+best_lasso <- select_best(lasso_rs, metric ="roc_auc")
+
+final_lasso_wf <- finalize_workflow(lasso_wf, best_lasso)
+
+final_lasso_fit <- fit(final_lasso_wf, data = news_train)
+
+```
+## Results For Tuned Model  
+```{r}
+final_lasso_predictions <- lasso_rs %>%
+  collect_predictions()
+
+final_lasso_metrics <- lasso_rs %>%
+  collect_metrics()
+```
+
+### Metrics Summary Table 
+```{r}
+final_lasso_metrics %>%
+  gt() %>%
+  tab_header(
+    title = "Null Performance Metrics Across 5 Folds"
+  ) %>%
+  fmt_number(
+    columns = c(mean, std_err),
+    decimals = 3
+  ) %>%
+  cols_label(
+    .metric = "Metric",
+    mean = "Mean Value",
+    std_err = "Standard Error"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+```
+
+### Confusion Matrix
+```{r}
+confusion <- final_lasso_predictions %>%
+  conf_mat(truth = label, estimate = .pred_class)
+autoplot(confusion, type = "heatmap") +
+  labs(
+    title = "Confusion Matrix for Final Lasso Model",
+    subtitle = "Predicted vs. Actual Labels"
+  ) +
+  theme_minimal()
+
+```
+
+### ROC 
+```{r}
+autoplot(lasso_rs)
+```
+
+### F1 Value 
+```{r}
+f1_results <- lasso_rs %>%
+  group_by(id) %>%
+  f_meas(truth = label, estimate = .pred_class)
+
+mean_f1 <- mean(f1_results$.estimate)
+
+ggplot(f1_results, aes(x = id, y = .estimate)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_hline(yintercept = mean_f1, color = "red", linetype = "dashed") +
+  annotate("text", x = Inf, y = mean_f1, label = paste("Mean F1 Score:", round(mean_f1, 2)), 
+           vjust = -0.5, hjust = 1.2, color = "red", size = 5) +
+  labs(
+    title = "F1 Score per Cross-Validation Fold",
+    x = "Fold",
+    y = "F1 Score"
+  ) +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+### Variable Importance 
+```{r}
+importance <- lasso_rs %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(abs(estimate))) %>%
+  head(20)
+
+ggplot(importance, aes(x = reorder(term, abs(estimate)), y = estimate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Most Influential Tokens",
+       x = "Token",
+       y = "Coefficient Estimate")
+```
+
+## Analysis
+
+The lasso - better tuned model performed slightly better than the other lasso, however there is additional computational need and given the added complexity I would say its not necessary when compared to the accuracy od the previous model. 
+
+# Excercise 7 : Deep Learning Model 
+
+## Timeout !
+```{r}
+i <- 15 # how many minutes do you want to set your timeout
+options(timeout = 60 * i)
+```
+
+
+## Lets Begin!
+```{r}
+library(keras3)
+max_tokens <- 7500
+max_len <- 250
+text_vectorization <- layer_text_vectorization(
+  max_tokens = max_tokens,
+  output_mode = "int",
+  output_sequence_length = max_len
+)
+adapt(text_vectorization, news_train$text)
+
+input <- layer_input(shape = c(1), dtype = "string")
+embedding <- input %>%
+  text_vectorization() %>%
+  layer_embedding(input_dim = max_tokens + 1, output_dim = 128) %>%
+  bidirectional(layer_lstm(units = 64, return_sequences = TRUE)) %>%
+  layer_global_max_pooling_1d()
+
+output <- embedding %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+model <- keras_model(input, output)
+model %>% compile(
+  optimizer = "adam",
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+```
+
+## Training 
+```{r}
+epochs_n <- 5 # Should be 10 but times out 
+history <- model %>% fit(
+  x = news_train$text,
+  y = news_train$label,
+  epochs = epochs_n,
+  batch_size = 32,
+  validation_split = 0.2,
+  callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 3))
+)
+```
+## Fitting on Training 
+```{r}
+final_predictions <- model %>% predict(news_train$text)
+final_class <- ifelse(final_predictions > 0.5, "Fake", "Real")
+
+results <- tibble(
+  truth = news_train$label,
+  prediction = factor(final_class, levels = c("Real", "Fake")),
+  prob_fake = final_predictions
+)
+
+```
+
+## Results 
+
+### Plot Training History 
+```{r}
+plot(history)
+```
+
+```{r}
+last_epoch_metrics <- tibble(
+  Metric = c("Final Training Accuracy", "Final Validation Accuracy", "Final Training Loss", "Final Validation Loss"),
+  Value = c(history$metrics$accuracy[length(history$metrics$accuracy)],
+            history$metrics$val_accuracy[length(history$metrics$val_accuracy)],
+            history$metrics$loss[length(history$metrics$loss)],
+            history$metrics$val_loss[length(history$metrics$val_loss)])
+)
+```
+
+
+```{r}
+last_epoch_metrics %>%
+  gt() %>%
+  tab_header(title = "Final Training and Validation Metrics") %>%
+  fmt_number(columns = c(Value), decimals = 3)
+```
+
+### Sumamry Metrics 
+```{r}
+accuracy <- accuracy(results, truth = truth, estimate = prediction)
+brier_score <- mean((results$prob_fake - as.numeric(as.factor(results$truth) == 2))^2)
+predictor <- as.numeric(results$prob_fake)
+roc_obj <- roc(results$truth, predictor, levels = c("Real", "Fake"))
+auc_value <- auc(roc_obj)
+
+train_f1 <- f_meas(results, truth = truth, estimate = prediction, event_level = "second")
+
+metrics_summary <- tibble(
+  Metric = c("Accuracy", "Brier Score", "ROC AUC", "F1 Score"),
+  Value = c(accuracy$.estimate, brier_score, auc_value, train_f1$.estimate)
+)
+
+# Display in gt table
+metrics_summary %>%
+  gt() %>%
+  tab_header(title = "Performance Metrics for Deep Learning Model") %>%
+  fmt_number(columns = c(Value), decimals = 3)
+```
+
+### Confusion Matrix 
+```{r}
+confusion <- results %>%
+  conf_mat(truth = truth, estimate = prediction)
+autoplot(confusion, type = "heatmap") +
+  labs(
+    title = "Confusion Matrix for Deep Learning Model",
+    subtitle = "Predicted vs. Actual Labels"
+  ) +
+  theme_minimal()
+```
+## Analysis 
+
+THe Deep LEarning performs the best out of all the other models with about a .99% accuracy in the training data and a high ROC-AUC value of about .97 demonstrating a good understanding of the difference between "Real" and "Fake" articles. I chose this model because Ive always liked deep learning models and wanted to have more practice with them, as well as I believed it would understand the nuances between the text better. 
+# Exercise 8: Fitting Deep Learning Model on Test 
+## Fitting on Testing  
+```{r}
+final_predictions <- model %>% predict(news_test$text)
+final_class <- ifelse(final_predictions > 0.5, "Fake", "Real")
+
+results <- tibble(
+  truth = news_test$label,
+  prediction = factor(final_class, levels = c("Real", "Fake")),
+  prob_fake = final_predictions
+)
+
+```
+
+### Sumamry Metrics + F1 
+```{r}
+accuracy <- accuracy(results, truth = truth, estimate = prediction)
+brier_score <- mean((results$prob_fake - as.numeric(as.factor(results$truth) == 2))^2)
+predictor <- as.numeric(results$prob_fake)
+roc_obj <- roc(results$truth, predictor, levels = c("Real", "Fake"))
+auc_value <- auc(roc_obj)
+test_f1 <- f_meas(results, truth = truth, estimate = prediction, event_level = "second")
+
+metrics_summary <- tibble(
+  Metric = c("Accuracy", "Brier Score", "ROC AUC", "F1 Score"),
+  Value = c(accuracy$.estimate, brier_score, auc_value, test_f1$.estimate)
+)
+
+metrics_summary %>%
+  gt() %>%
+  tab_header(title = "Performance Metrics for Deep Learning Model") %>%
+  fmt_number(columns = c(Value), decimals = 3)
+```
+### Confusion Matrix 
+```{r}
+confusion <- results %>%
+  conf_mat(truth = truth, estimate = prediction)
+autoplot(confusion, type = "heatmap") +
+  labs(
+    title = "Confusion Matrix for Deep Learning Model on Test Data",
+    subtitle = "Predicted vs. Actual Labels"
+  ) +
+  theme_minimal()
+```
+
+## Analysis 
+
+I decided to fit the the final prediction model with the Deep Learning model, it performed about .92 accuracy and demonstrating high retention and knowledge between Real and Fake news. 
+
+
